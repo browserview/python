@@ -83,6 +83,18 @@ class Session:
     #: ``True`` when the session has restarted at least once
     #: (:meth:`BrowserView.get_session` only).
     degraded: bool = False
+    #: The applied per-session configuration (proxy/user_agent/locale/
+    #: timezone/geolocation/stealth/downloads/context_id/...), echoed back by
+    #: the server with proxy credentials redacted. Empty when none were set.
+    config: dict[str, Any] = None  # type: ignore[assignment]
+    #: Free-form searchable labels attached at create time.
+    metadata: dict[str, str] = None  # type: ignore[assignment]
+
+    def __post_init__(self) -> None:
+        if self.config is None:
+            self.config = {}
+        if self.metadata is None:
+            self.metadata = {}
 
 
 @dataclass
@@ -148,8 +160,9 @@ class BrowserView:
             environment variable.
         base_url: API origin. Defaults to the ``BROWSERVIEW_BASE_URL``
             environment variable, then ``https://sessions.browserview.io``.
-        timeout: Request timeout in seconds. Defaults to 60 (session creation
-            with ``wait=True`` blocks ~5s; leave headroom).
+        timeout: Request timeout in seconds. Defaults to 90 (session creation
+            with ``wait=True`` blocks ~5s, sometimes up to ~60s server-side;
+            leave headroom).
         max_retries: Maximum automatic retries per request for retryable
             failures (HTTP 429/503 on any method, plus transport errors on
             idempotent GET/DELETE). ``0`` disables retries. The client honors
@@ -165,7 +178,7 @@ class BrowserView:
         self,
         api_key: Optional[str] = None,
         base_url: Optional[str] = None,
-        timeout: float = 60.0,
+        timeout: float = 90.0,
         max_retries: int = 3,
         transport: Optional[httpx.BaseTransport] = None,
     ) -> None:
@@ -201,6 +214,17 @@ class BrowserView:
         height: Optional[int] = None,
         wait: Optional[bool] = None,
         record: Optional[bool] = None,
+        max_lifetime_seconds: Optional[int] = None,
+        proxy: Optional[dict[str, str]] = None,
+        user_agent: Optional[str] = None,
+        locale: Optional[str] = None,
+        timezone: Optional[str] = None,
+        geolocation: Optional[dict[str, float]] = None,
+        stealth: Optional[bool] = None,
+        downloads: Optional[bool] = None,
+        context_id: Optional[str] = None,
+        solve_captchas: Optional[bool] = None,
+        metadata: Optional[dict[str, str]] = None,
     ) -> Session:
         """Create a new browser session.
 
@@ -208,6 +232,12 @@ class BrowserView:
         defaults otherwise (``start_url`` "about:blank", 1280x800,
         ``wait`` true — which blocks until the browser is ready, typically
         ~5 seconds).
+
+        Note: ``user_agent``/``locale``/``timezone``/``geolocation``/
+        ``stealth``/``proxy`` overrides are fully applied once the session is
+        healthy — the very first ``start_url`` navigation may go out with
+        stock browser headers. If the first request matters, create with
+        ``start_url="about:blank"`` and navigate yourself over CDP.
 
         Args:
             start_url: Initial page URL.
@@ -219,25 +249,69 @@ class BrowserView:
                 action/console/network/error streams, retrievable via
                 :meth:`get_replay` after the session ends). Server default
                 is false.
+            max_lifetime_seconds: Auto-destroy the session after this many
+                seconds (clamped to the plan/global caps).
+            proxy: ``{"server": "scheme://host:port", "username": ...,
+                "password": ..., "bypass": ...}`` — egress through a proxy.
+                Credentials never reach the browser's command line and are
+                redacted in API responses.
+            user_agent: Override the browser's User-Agent string.
+            locale: e.g. ``"en-US"`` — sets ``navigator.language`` and
+                ``Accept-Language``.
+            timezone: IANA name, e.g. ``"America/New_York"``.
+            geolocation: ``{"lat": ..., "lon": ..., "accuracy": ...}``.
+            stealth: Standard-tier anti-automation-detection tweaks.
+            downloads: Mount a writable, persisted ``/downloads`` directory
+                and enable :meth:`list_downloads` / :meth:`download_file` /
+                :meth:`upload_file` for this session.
+            context_id: Owner-scoped persistent context — cookies from a
+                previous session with the same id are restored before you
+                start driving, and archived back on end.
+            solve_captchas: Record intent for captcha solving (the
+                :meth:`solve_captcha` endpoint is separately gated on a
+                server-configured provider).
+            metadata: ``{key: value}`` string labels, searchable via
+                ``list_sessions(metadata=...)``.
         """
         body: dict[str, Any] = {}
-        if start_url is not None:
-            body["start_url"] = start_url
-        if width is not None:
-            body["width"] = width
-        if height is not None:
-            body["height"] = height
-        if wait is not None:
-            body["wait"] = wait
-        if record is not None:
-            body["record"] = record
+        optional: dict[str, Any] = {
+            "start_url": start_url,
+            "width": width,
+            "height": height,
+            "wait": wait,
+            "record": record,
+            "max_lifetime_seconds": max_lifetime_seconds,
+            "proxy": proxy,
+            "user_agent": user_agent,
+            "locale": locale,
+            "timezone": timezone,
+            "geolocation": geolocation,
+            "stealth": stealth,
+            "downloads": downloads,
+            "context_id": context_id,
+            "solve_captchas": solve_captchas,
+            "metadata": metadata,
+        }
+        for key, value in optional.items():
+            if value is not None:
+                body[key] = value
         data = self._request("POST", "/sessions", json=body)
         return self._session_from(data)
 
-    def list_sessions(self) -> list[Session]:
+    def list_sessions(
+        self, metadata: Optional[dict[str, str]] = None
+    ) -> list[Session]:
         """List all sessions. URL and token fields are omitted; use
-        :meth:`get_session` for fresh ones."""
-        data = self._request("GET", "/sessions")
+        :meth:`get_session` for fresh ones.
+
+        Args:
+            metadata: Only return sessions whose metadata labels contain
+                every given ``{key: value}`` pair.
+        """
+        params = None
+        if metadata:
+            params = {f"metadata.{k}": v for k, v in metadata.items()}
+        data = self._request("GET", "/sessions", params=params)
         return [self._session_from(item) for item in data]
 
     def get_session(self, session_id: str) -> Session:
@@ -280,6 +354,114 @@ class BrowserView:
             ttl_seconds=data.get("ttl_seconds", ttl_seconds),
         )
 
+    # -- screenshot, downloads, captcha -------------------------------------
+
+    def screenshot(
+        self,
+        session_id: str,
+        format: str = "png",
+        quality: int = 80,
+    ) -> bytes:
+        """Capture a current-viewport image of a live session.
+
+        Args:
+            session_id: Target session id.
+            format: ``"png"``, ``"jpeg"``, or ``"webp"``.
+            quality: 1-100, for lossy formats.
+
+        Returns:
+            The raw image bytes.
+        """
+        return self._request(
+            "GET",
+            f"/sessions/{self._quote(session_id)}/screenshot",
+            params={"format": format, "quality": quality},
+            raw=True,
+        )
+
+    def list_downloads(self, session_id: str) -> list[dict[str, Any]]:
+        """List a downloads-enabled session's files (works during and after
+        the session).
+
+        Returns:
+            ``[{"name", "size_bytes", "modified_ms"}]``.
+        """
+        data = self._request(
+            "GET", f"/sessions/{self._quote(session_id)}/downloads"
+        )
+        return data.get("files", []) if isinstance(data, dict) else []
+
+    def download_file(self, session_id: str, name: str) -> bytes:
+        """Fetch one downloaded file's contents (follows the presigned-S3
+        redirect the server issues after the session ends)."""
+        return self._request(
+            "GET",
+            f"/sessions/{self._quote(session_id)}/downloads/"
+            f"{urllib.parse.quote(name, safe='')}",
+            raw=True,
+            follow_redirects=True,
+        )
+
+    def upload_file(
+        self,
+        session_id: str,
+        content: bytes,
+        filename: str,
+    ) -> dict[str, Any]:
+        """Place a file into a live session's ``/downloads`` mount (for
+        ``input[type=file]`` flows — attach it via CDP
+        ``DOM.setFileInputFiles`` with the returned container ``path``).
+
+        The session must have been created with ``downloads=True``.
+
+        Returns:
+            ``{"name", "path", "size_bytes"}`` — ``path`` is the file's
+            location inside the session container.
+        """
+        return self._request(
+            "POST",
+            f"/sessions/{self._quote(session_id)}/files",
+            files={"file": (filename, content)},
+        )
+
+    def solve_captcha(
+        self,
+        session_id: str,
+        type: str,
+        sitekey: str,
+        url: str,
+        action: Optional[str] = None,
+    ) -> str:
+        """Relay a captcha challenge to the server-configured solver and
+        return the solution token for your agent to inject.
+
+        Raises a 501 :class:`BrowserViewError` when solving is not enabled
+        on the host.
+
+        Args:
+            session_id: Target session id.
+            type: ``"recaptcha_v2"``, ``"recaptcha_v3"``, ``"hcaptcha"``,
+                or ``"turnstile"``.
+            sitekey: The site key from the challenge on the page.
+            url: The page URL hosting the challenge.
+            action: reCAPTCHA v3 action, when applicable.
+        """
+        body: dict[str, Any] = {"type": type, "sitekey": sitekey, "url": url}
+        if action is not None:
+            body["action"] = action
+        data = self._request(
+            "POST",
+            f"/sessions/{self._quote(session_id)}/captcha/solve",
+            json=body,
+        )
+        token = data.get("token") if isinstance(data, dict) else None
+        if not isinstance(token, str) or not token:
+            raise BrowserViewError(
+                "browserview: unexpected captcha response from the server "
+                "(missing 'token' field)"
+            )
+        return token
+
     # -- replay ------------------------------------------------------------
 
     def get_replay(self, session_id: str) -> Replay:
@@ -306,7 +488,8 @@ class BrowserView:
 
         Polls through the live (``status="recording"``) and finalizing (404)
         states. Raises :class:`BrowserViewError` on timeout; any non-404 API
-        error propagates immediately.
+        error propagates immediately, as does a 404 reporting that the live
+        session is not being recorded (one created without ``record=True``).
         """
         deadline = time.monotonic() + timeout
         while True:
@@ -317,6 +500,12 @@ class BrowserView:
             except BrowserViewError as e:
                 if e.status_code != 404:
                     raise
+                if "not being recorded" in str(e):
+                    raise BrowserViewError(
+                        f"browserview: session {session_id} was not created "
+                        "with record=True, so it has no replay",
+                        e.status_code,
+                    ) from e
             if time.monotonic() + interval > deadline:
                 raise BrowserViewError(
                     f"browserview: replay for session {session_id} was not "
@@ -352,12 +541,28 @@ class BrowserView:
     def _quote(session_id: str) -> str:
         return urllib.parse.quote(session_id, safe="")
 
-    def _request(self, method: str, path: str, json: Any = None) -> Any:
+    def _request(
+        self,
+        method: str,
+        path: str,
+        json: Any = None,
+        params: Any = None,
+        files: Any = None,
+        raw: bool = False,
+        follow_redirects: bool = False,
+    ) -> Any:
         retryable_transport = method in ("GET", "DELETE")
         attempt = 0
         while True:
             try:
-                response = self._http.request(method, path, json=json)
+                response = self._http.request(
+                    method,
+                    path,
+                    json=json,
+                    params=params,
+                    files=files,
+                    follow_redirects=follow_redirects,
+                )
             except httpx.TransportError:
                 if retryable_transport and attempt < self.max_retries:
                     _sleep(self._backoff(attempt))
@@ -366,6 +571,8 @@ class BrowserView:
                 raise
 
             if response.is_success:
+                if raw:
+                    return response.content
                 return None if response.status_code == 204 else response.json()
 
             retry_after = self._parse_retry_after(response)

@@ -16,7 +16,7 @@ pip install browserview
 | --- | --- | --- | --- |
 | API key | `api_key` | `BROWSERVIEW_API_KEY` | required |
 | Base URL | `base_url` | `BROWSERVIEW_BASE_URL` | `https://sessions.browserview.io` |
-| Timeout | `timeout` | — | `60.0` seconds |
+| Timeout | `timeout` | — | `90.0` seconds |
 | Retries | `max_retries` | — | `3` (`0` disables) |
 
 Precedence: explicit constructor arg > environment variable > default.
@@ -39,7 +39,7 @@ with BrowserView() as bv:  # reads BROWSERVIEW_API_KEY (and BROWSERVIEW_BASE_URL
     bv.destroy_session(session.id)
 ```
 
-`create_session` only sends the fields you set; server defaults are `start_url="about:blank"`, `1280x800`, and `wait=True` — with `wait` the call blocks until the browser is ready, typically ~5 seconds (the default 60s timeout leaves ample headroom). Bounds: width 320-3840, height 240-2160.
+`create_session` only sends the fields you set; server defaults are `start_url="about:blank"`, `1280x800`, and `wait=True` — with `wait` the call blocks until the browser is ready, typically ~5 seconds and up to ~60s server-side (the default 90s timeout leaves headroom). Bounds: width 320-3840, height 240-2160.
 
 Other operations:
 
@@ -76,6 +76,42 @@ with BrowserView() as bv, sync_playwright() as p:
 
 The token can also be passed as `?token=` on the CDP URL. Session-scoped tokens (from `mint_token`) authenticate viewer/CDP/signal endpoints the same two ways.
 
+## Per-session configuration
+
+All create-time knobs are keyword arguments to `create_session`; only the ones you set are sent:
+
+```python
+session = bv.create_session(
+    start_url="about:blank",
+    stealth=True,                              # anti-automation-detection tweaks
+    user_agent="MyAgent/1.0",
+    locale="en-GB",
+    timezone="America/New_York",
+    geolocation={"lat": 40.7, "lon": -74.0},
+    proxy={"server": "http://proxy:8080", "username": "u", "password": "p"},
+    context_id="my-login",                     # cookies persist across runs under this id
+    downloads=True,                            # persisted /downloads mount + file APIs
+    metadata={"job": "crawl-1"},               # searchable labels
+    max_lifetime_seconds=600,
+)
+```
+
+Overrides apply once the session is healthy — the very first `start_url` navigation can go out with stock headers, so navigate over CDP from `about:blank` when the first request matters. The applied config (secrets redacted) is echoed on `session.config`; labels on `session.metadata`.
+
+```python
+bv.list_sessions(metadata={"job": "crawl-1"})            # filter by labels
+
+image = bv.screenshot(session.id, format="png")          # current-viewport bytes
+
+files = bv.list_downloads(session.id)                    # [{name, size_bytes, modified_ms}]
+data = bv.download_file(session.id, files[0]["name"])    # bytes; works after the session ends
+bv.upload_file(session.id, b"col1,col2", "input.csv")    # into /downloads for file-input flows
+
+token = bv.solve_captcha(                                # 501 unless the host has a solver
+    session.id, "turnstile", sitekey="0x...", url="https://target.example",
+)
+```
+
 ## Session replay
 
 Create the session with `record=True` and BrowserView captures everything server-side — a video of the display plus structured streams of actions, console output, network requests, and errors:
@@ -94,7 +130,7 @@ with BrowserView() as bv:
     print(replay.events["console"]["url"])  # JSONL: {"ts": ..., "level": ...}
 ```
 
-`get_replay(session_id)` fetches the manifest without polling: it returns `Replay(status="recording")` while the session is alive and raises a 404 `BrowserViewError` while the recording finalizes. Every event line carries an absolute epoch-ms `ts`; align it with the video via `(ts - replay.video["start_time_ms"]) / 1000` seconds. Artifact URLs expire at `urls_expire_at_ms` — call `get_replay` again for fresh ones.
+`get_replay(session_id)` fetches the manifest without polling: it returns `Replay(status="recording")` while the session is alive and raises a 404 `BrowserViewError` while the recording finalizes. If the live session was created without `record=True`, `wait_for_replay` fails immediately instead of polling. Every event line carries an absolute epoch-ms `ts`; align it with the video via `(ts - replay.video["start_time_ms"]) / 1000` seconds. Artifact URLs expire at `urls_expire_at_ms` — call `get_replay` again for fresh ones.
 
 ## Errors and retries
 
@@ -102,9 +138,11 @@ Non-2xx responses raise `BrowserViewError` with `status_code` and `retry_after` 
 
 - `401` — invalid or missing key (repeated failures escalate to 429 per-IP)
 - `404` — unknown session, or one you don't own
-- `429` + `Retry-After: 30` — rate or capacity limits (session limits, memory, ports)
+- `429` + `Retry-After: 30` — session/capacity limits on create (session limits, memory, ports)
+- `429` + `Retry-After: 60` — request/create rate limits (per IP or per owner) and repeated auth failures
 - `502` — session create/backend failure
 - `503` + `Retry-After: 10` — auth backend temporarily unavailable
+- `503` + `Retry-After: 60` — recording backend unavailable (create with `record=True`)
 
 The client retries automatically: HTTP `429`/`503` on **all** methods (creating a session is safe to retry on these — the session was not created), and transport/network errors on idempotent `GET`/`DELETE`. It honors `Retry-After` when present (each wait capped at 30s), otherwise backs off 1s, 2s, 4s. Up to `max_retries` retries (default 3); set `max_retries=0` to disable.
 

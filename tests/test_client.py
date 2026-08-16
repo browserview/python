@@ -311,6 +311,24 @@ def test_wait_for_replay_polls_through_recording_and_404(sleeps):
     assert calls["n"] == 3
 
 
+def test_wait_for_replay_fast_fails_when_not_recorded(sleeps):
+    calls = {"n": 0}
+
+    def handler(request):
+        calls["n"] += 1
+        return httpx.Response(
+            404, json={"detail": "session is not being recorded"}
+        )
+
+    with make_client(handler) as bv:
+        with pytest.raises(BrowserViewError) as excinfo:
+            bv.wait_for_replay("x", timeout=60, interval=1)
+    assert "record=True" in str(excinfo.value)
+    assert excinfo.value.status_code == 404
+    assert calls["n"] == 1  # failed on the first poll, no timeout burned
+    assert sleeps == []
+
+
 def test_wait_for_replay_propagates_non_404():
     def handler(request):
         return httpx.Response(403, json={"detail": "nope"})
@@ -356,3 +374,135 @@ def test_default_base_url(monkeypatch):
     bv = BrowserView(api_key="k", transport=httpx.MockTransport(lambda r: None))
     assert bv.base_url == "https://sessions.browserview.io"
     bv.close()
+
+
+# -- P2 per-session knobs and endpoints ------------------------------------
+
+
+def test_create_session_sends_p2_knobs():
+    def handler(request):
+        body = jsonlib.loads(request.content)
+        assert body == {
+            "start_url": "about:blank",
+            "stealth": True,
+            "downloads": True,
+            "user_agent": "UA/1.0",
+            "locale": "en-GB",
+            "timezone": "America/New_York",
+            "geolocation": {"lat": 40.7, "lon": -74.0},
+            "proxy": {"server": "http://p:8080", "username": "u", "password": "s"},
+            "context_id": "login-1",
+            "solve_captchas": True,
+            "metadata": {"job": "x"},
+            "max_lifetime_seconds": 600,
+        }
+        return httpx.Response(201, json=SESSION_BODY)
+
+    with make_client(handler) as bv:
+        bv.create_session(
+            start_url="about:blank",
+            stealth=True,
+            downloads=True,
+            user_agent="UA/1.0",
+            locale="en-GB",
+            timezone="America/New_York",
+            geolocation={"lat": 40.7, "lon": -74.0},
+            proxy={"server": "http://p:8080", "username": "u", "password": "s"},
+            context_id="login-1",
+            solve_captchas=True,
+            metadata={"job": "x"},
+            max_lifetime_seconds=600,
+        )
+
+
+def test_session_exposes_config_and_metadata():
+    body = dict(SESSION_BODY, config={"stealth": True}, metadata={"job": "x"})
+
+    def handler(request):
+        return httpx.Response(200, json=body)
+
+    with make_client(handler) as bv:
+        session = bv.get_session("3f9c62d81b4a")
+    assert session.config == {"stealth": True}
+    assert session.metadata == {"job": "x"}
+
+
+def test_list_sessions_metadata_filter():
+    def handler(request):
+        assert request.url.params["metadata.job"] == "x"
+        return httpx.Response(200, json=[SESSION_BODY])
+
+    with make_client(handler) as bv:
+        assert len(bv.list_sessions(metadata={"job": "x"})) == 1
+
+
+def test_screenshot_returns_bytes():
+    def handler(request):
+        assert request.url.path == "/sessions/abc/screenshot"
+        assert request.url.params["format"] == "webp"
+        assert request.url.params["quality"] == "70"
+        return httpx.Response(200, content=b"\x89IMG", headers={"content-type": "image/webp"})
+
+    with make_client(handler) as bv:
+        assert bv.screenshot("abc", format="webp", quality=70) == b"\x89IMG"
+
+
+def test_list_downloads():
+    files = [{"name": "a.pdf", "size_bytes": 3, "modified_ms": 1}]
+
+    def handler(request):
+        assert request.url.path == "/sessions/abc/downloads"
+        return httpx.Response(200, json={"session_id": "abc", "files": files})
+
+    with make_client(handler) as bv:
+        assert bv.list_downloads("abc") == files
+
+
+def test_download_file_follows_redirect():
+    def handler(request):
+        if request.url.path == "/sessions/abc/downloads/a.pdf":
+            return httpx.Response(302, headers={"location": f"{BASE}/presigned/a.pdf"})
+        assert request.url.path == "/presigned/a.pdf"
+        return httpx.Response(200, content=b"pdfbytes")
+
+    with make_client(handler) as bv:
+        assert bv.download_file("abc", "a.pdf") == b"pdfbytes"
+
+
+def test_upload_file_multipart():
+    def handler(request):
+        assert request.url.path == "/sessions/abc/files"
+        assert b'filename="in.csv"' in request.content
+        assert b"col1,col2" in request.content
+        return httpx.Response(
+            201, json={"name": "in.csv", "path": "/downloads/in.csv", "size_bytes": 9}
+        )
+
+    with make_client(handler) as bv:
+        result = bv.upload_file("abc", b"col1,col2", "in.csv")
+    assert result["path"] == "/downloads/in.csv"
+
+
+def test_solve_captcha_returns_token():
+    def handler(request):
+        assert request.url.path == "/sessions/abc/captcha/solve"
+        body = jsonlib.loads(request.content)
+        assert body == {
+            "type": "turnstile",
+            "sitekey": "0xKEY",
+            "url": "https://target.example",
+        }
+        return httpx.Response(200, json={"token": "solved", "type": "turnstile"})
+
+    with make_client(handler) as bv:
+        assert bv.solve_captcha("abc", "turnstile", "0xKEY", "https://target.example") == "solved"
+
+
+def test_solve_captcha_disabled_raises_501():
+    def handler(request):
+        return httpx.Response(501, json={"detail": "captcha solving is not enabled"})
+
+    with make_client(handler) as bv:
+        with pytest.raises(BrowserViewError) as excinfo:
+            bv.solve_captcha("abc", "turnstile", "k", "https://x")
+    assert excinfo.value.status_code == 501

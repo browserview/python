@@ -4,7 +4,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "browserview"
-version = "0.3.1"
+version = "0.4.0"
 description = "Python client for the browserview.io API - disposable cloud browser sessions with a live viewer and CDP access."
 readme = "README.md"
 license = "MIT"
